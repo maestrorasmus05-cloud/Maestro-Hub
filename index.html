@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-<meta name="theme-color" content="#0YOUR_SUPABASE_URLA0B0D" />
+<meta name="theme-color" content="#0A0B0D" />
 <meta name="description" content="Maestro Hub — AI-powered social platform for creators, spaces, and real-time communities." />
 <title>Maestro Hub</title>
 <link rel="icon" href="favicon.svg" type="image/svg+xml" />
@@ -617,8 +617,8 @@
 </div>
 
 <script>
-const SUPABASE_URL = 'https://rceymoswrrnrmbezzcwn.supabase.co';
-const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJjZXltb3N3cnJucm1iZXp6Y3duIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODgxNTMxMDgsImV4cCI6MjEwMzcyOTEwOH0.xciqSdyYpNLA6o-Mbz9rUPN69OWMRIxEQlGf3PqPag8';
+const SUPABASE_URL = 'YOUR_SUPABASE_URL';
+const SUPABASE_ANON_KEY = 'YOUR_SUPABASE_ANON_KEY';
 
 let sb = null;
 const supabaseReady = SUPABASE_URL.startsWith('http') && SUPABASE_ANON_KEY !== 'YOUR_SUPABASE_ANON_KEY';
@@ -676,12 +676,16 @@ const db = {
   },
   async search(query){
     if (sb) {
-      const [{ data: people }, { data: spaces }, { data: posts }] = await Promise.all([
-        sb.from('profiles').select('*').ilike('name', `%${query}%`).limit(5),
-        sb.from('spaces').select('*').ilike('name', `%${query}%`).limit(5),
-        sb.from('posts').select('*').ilike('body', `%${query}%`).limit(5),
+      const q = query.trim();
+      const [{ data: peopleByName }, { data: peopleByHandle }, { data: spaces }, { data: posts }] = await Promise.all([
+        sb.from('profiles').select('id, name, handle, bio, avatar_url').ilike('name', `%${q}%`).limit(10),
+        sb.from('profiles').select('id, name, handle, bio, avatar_url').ilike('handle', `%${q}%`).limit(10),
+        sb.from('spaces').select('*').ilike('name', `%${q}%`).limit(5),
+        sb.from('posts').select('id, body, created_at').ilike('body', `%${q}%`).limit(5),
       ]);
-      return { people: people||[], spaces: spaces||[], posts: posts||[] };
+      const map = new Map();
+      [...(peopleByName||[]), ...(peopleByHandle||[])].forEach(p => { if (p && p.id) map.set(p.id, p); });
+      return { people: [...map.values()], spaces: spaces||[], posts: posts||[] };
     }
     const q = query.toLowerCase();
     return {
@@ -689,6 +693,26 @@ const db = {
       spaces: MOCK.spaces.filter(s => s.name.toLowerCase().includes(q)),
       posts: MOCK.posts.filter(p => p.body.toLowerCase().includes(q)),
     };
+  },
+  async getPeople(){
+    if (sb) {
+      const { data, error } = await sb.from('profiles').select('id, name, handle, bio, avatar_url').order('name').limit(50);
+      if (!error && data && data.length) return data;
+    }
+    return MOCK.people;
+  },
+  async ensureProfile({ id, name, handle, email }){
+    if (!sb || !id) return;
+    const h = handle ? (handle.startsWith('@') ? handle : '@' + handle) : null;
+    const row = {
+      id,
+      name: name || (email ? email.split('@')[0] : 'User'),
+      handle: h || ('@user' + String(id).slice(0, 6)),
+      bio: ''
+    };
+    const { error } = await sb.from('profiles').upsert(row, { onConflict: 'id' });
+    if (error) console.warn('ensureProfile', error.message);
+    return row;
   }
 };
 
@@ -1007,27 +1031,48 @@ function renderProfile(){
   `;
 }
 
-function renderSearch(query){
+async function renderSearch(query){
   query = query || '';
-  const q = query.toLowerCase();
-  const people = q ? MOCK.people.filter(p => p.name.toLowerCase().includes(q) || p.handle.toLowerCase().includes(q)) : [];
-  const spaces = q ? MOCK.spaces.filter(s => s.name.toLowerCase().includes(q)) : [];
-  const posts = q ? MOCK.posts.filter(p => p.body.toLowerCase().includes(q)) : [];
   const inputRow = `
     <div class="panel search-page-input" role="search">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
       <label for="searchPageInput" class="sr-only">Search people, spaces, posts</label>
-      <input type="search" id="searchPageInput" placeholder="Search people, spaces, posts…" value="${query.replace(/"/g,'&quot;')}" autocomplete="off" />
+      <input type="search" id="searchPageInput" placeholder="Search people, spaces, posts…" value="${String(query).replace(/"/g,'&quot;')}" autocomplete="off" />
     </div>`;
+  if (!query.trim()) {
+    // Show real people directory when search is empty
+    const allPeople = await db.getPeople();
+    const list = (allPeople||[]).map(p => {
+      const name = p.name || 'User';
+      const handle = p.handle || '';
+      const bio = p.bio || '';
+      const letter = name[0] || '?';
+      return `<button type="button" class="search-row" data-profile-id="${p.id||''}" aria-label="${name}">
+        <div class="avatar" aria-hidden="true">${letter}</div>
+        <div><div class="t">${name}</div><div class="s">${handle}${bio ? ' · ' + bio : ''}</div></div>
+      </button>`;
+    }).join('');
+    return `<div class="section-eyebrow"><span>Search</span></div>${inputRow}
+      <div class="panel search-results" role="region" aria-label="People on Maestro Hub">
+        <div class="search-section-label">People on Maestro Hub</div>
+        ${list || '<div class="search-empty">No profiles yet. Sign up accounts will appear here.</div>'}
+      </div>`;
+  }
+  const results = await db.search(query);
+  const people = results.people || [];
+  const spaces = results.spaces || [];
+  const posts = results.posts || [];
   let resultsHtml;
-  if (!query) resultsHtml = `<div class="panel search-empty">Start typing to search people, Spaces, and posts across Maestro Hub.</div>`;
-  else if (!people.length && !spaces.length && !posts.length) resultsHtml = `<div class="panel search-empty" role="status">No results for “${query}”.</div>`;
-  else resultsHtml = `
+  if (!people.length && !spaces.length && !posts.length) {
+    resultsHtml = `<div class="panel search-empty" role="status">No results for “${query}”.</div>`;
+  } else {
+    resultsHtml = `
     <div class="panel search-results" role="region" aria-label="Search results">
-      ${people.length ? `<div class="search-section-label" id="people-results">People</div>${people.map(p=>`<button type="button" class="search-row" aria-labelledby="people-results"><div class="avatar" aria-hidden="true">${p.name[0]}</div><div><div class="t">${p.name}</div><div class="s">${p.handle}</div></div></button>`).join('')}` : ''}
-      ${spaces.length ? `<div class="search-section-label" id="spaces-results">Spaces</div>${spaces.map(s=>`<button type="button" class="search-row" aria-labelledby="spaces-results"><div class="avatar" style="border-radius:12px;" aria-hidden="true">${s.name[0]}</div><div><div class="t">${s.name}</div><div class="s">${s.members} members</div></div></button>`).join('')}` : ''}
-      ${posts.length ? `<div class="search-section-label" id="posts-results">Posts</div>${posts.map(p=>`<button type="button" class="search-row" aria-labelledby="posts-results"><div class="avatar" aria-hidden="true">${p.author[0]}</div><div><div class="t">${p.author}</div><div class="s">${p.body.slice(0,60)}…</div></div></button>`).join('')}` : ''}
+      ${people.length ? `<div class="search-section-label">People</div>${people.map(p=>`<button type="button" class="search-row" data-profile-id="${p.id||''}"><div class="avatar" aria-hidden="true">${(p.name||'?')[0]}</div><div><div class="t">${p.name||''}</div><div class="s">${p.handle||''}${p.bio ? ' · ' + p.bio : ''}</div></div></button>`).join('')}` : ''}
+      ${spaces.length ? `<div class="search-section-label">Spaces</div>${spaces.map(s=>`<button type="button" class="search-row"><div class="avatar" style="border-radius:12px;" aria-hidden="true">${(s.name||'?')[0]}</div><div><div class="t">${s.name||''}</div><div class="s">${s.members_count != null ? s.members_count + ' members' : (s.members||'')}</div></div></button>`).join('')}` : ''}
+      ${posts.length ? `<div class="search-section-label">Posts</div>${posts.map(p=>`<button type="button" class="search-row"><div class="avatar" aria-hidden="true">P</div><div><div class="t">Post</div><div class="s">${(p.body||'').slice(0,60)}…</div></div></button>`).join('')}` : ''}
     </div>`;
+  }
   return `<div class="section-eyebrow"><span>Search</span></div>${inputRow}${resultsHtml}`;
 }
 
@@ -1843,10 +1888,15 @@ async function handleLogin(e){
       const { data, error } = await sb.auth.signInWithPassword({ email, password });
       if (error) throw error;
       const meta = data.user?.user_metadata || {};
-      localStorage.setItem('maestro_session', JSON.stringify({ mode: 'user', email }));
+      const name = meta.name || email.split('@')[0];
+      const handle = meta.handle || email.split('@')[0];
+      if (data.user) {
+        await db.ensureProfile({ id: data.user.id, name, handle, email });
+      }
+      localStorage.setItem('maestro_session', JSON.stringify({ mode: 'user', email, name, handle }));
       msg.classList.add('ok');
       msg.textContent = 'Welcome back!';
-      setTimeout(() => enterApp({ name: meta.name, handle: meta.handle, email }), 400);
+      setTimeout(() => enterApp({ name, handle, email }), 400);
     } else {
       // Demo login (no Supabase yet)
       localStorage.setItem('maestro_session', JSON.stringify({ mode: 'demo', email }));
@@ -1879,18 +1929,13 @@ async function handleSignup(e){
         options: { data: { name, handle } }
       });
       if (error) throw error;
-      // Optional: insert profile row
       if (data.user) {
-        try {
-          await sb.from('profiles').upsert({
-            id: data.user.id, name, handle: '@' + handle, bio: ''
-          });
-        } catch (_) {}
+        await db.ensureProfile({ id: data.user.id, name, handle, email });
       }
-      localStorage.setItem('maestro_session', JSON.stringify({ mode: 'user', email }));
+      localStorage.setItem('maestro_session', JSON.stringify({ mode: 'user', email, name, handle }));
       msg.classList.add('ok');
-      msg.textContent = 'Account created! Check your email if confirmation is required.';
-      setTimeout(() => enterApp({ name, handle, email }), 600);
+      msg.textContent = 'Account created!';
+      setTimeout(() => enterApp({ name, handle, email }), 400);
     } else {
       localStorage.setItem('maestro_session', JSON.stringify({ mode: 'demo', email, name, handle }));
       msg.classList.add('ok');
