@@ -129,6 +129,40 @@
   .chip.ai{ background:var(--purple-dim); color:#C9B8FF; border-color:rgba(155,123,255,0.3); }
   .post-btn{ padding:9px 22px; border-radius:20px; background:var(--lime); color:#0A0B0D; font-weight:700; font-size:13.5px; transition:.15s ease; }
   .post-btn:hover{ filter:brightness(1.06); }
+  .post-btn:disabled{ opacity:.55; cursor:not-allowed; filter:none; }
+  .composer-input{ color:var(--off-white); }
+  .composer-input::placeholder{ color:var(--muted-2); }
+  .media-preview{
+    position:relative; margin-top:4px; border-radius:14px; overflow:hidden;
+    border:1px solid var(--line); max-height:280px; background:var(--charcoal);
+  }
+  .media-preview img, .media-preview video{
+    display:block; width:100%; max-height:280px; object-fit:cover;
+  }
+  .media-preview .rm{
+    position:absolute; top:10px; right:10px; width:32px; height:32px; border-radius:50%;
+    background:rgba(10,11,13,0.75); border:1px solid var(--line-strong); color:#fff;
+    display:flex; align-items:center; justify-content:center; cursor:pointer;
+  }
+  .media-drop{
+    border:1.5px dashed var(--line-strong); border-radius:14px; padding:18px;
+    text-align:center; color:var(--muted-2); font-size:13px; cursor:pointer;
+    transition:border-color .15s, background .15s;
+  }
+  .media-drop:hover, .media-drop.drag{ border-color:var(--lime); background:var(--lime-dim); color:var(--off-white); }
+  .media-drop strong{ color:var(--lime); display:block; margin-bottom:4px; font-size:14px; }
+  .compose-hero{
+    padding:20px; display:flex; flex-direction:column; gap:16px;
+  }
+  .compose-hero .composer-input{
+    min-height:120px; font-size:17px; line-height:1.5; padding:4px 0;
+  }
+  .compose-status{ font-size:12.5px; color:var(--muted-2); min-height:18px; font-family:var(--font-mono); }
+  .compose-status.err{ color:var(--danger); }
+  .compose-status.ok{ color:var(--lime); }
+  .chip.active{ background:var(--lime-dim); border-color:rgba(200,255,77,0.35); color:var(--lime); }
+  .post-media img{ width:100%; height:100%; object-fit:cover; display:block; }
+
 
   .tabs{ display:flex; gap:4px; padding:5px; border-radius:16px; background:var(--charcoal); border:1px solid var(--line); overflow-x:auto; }
   .tab{ flex:1; text-align:center; padding:9px 10px; border-radius:12px; font-size:13.5px; font-weight:600; color:var(--muted); transition:.15s ease; white-space:nowrap; background:none; border:none; cursor:pointer; }
@@ -485,11 +519,11 @@
     <form class="auth-form" id="signupForm" autocomplete="on">
       <div class="auth-field">
         <label for="signupName">Display name</label>
-        <input type="text" id="signupName" name="name" required placeholder="JABIRO CHRIS J." autocomplete="name" maxlength="40" />
+        <input type="text" id="signupName" name="name" required placeholder="jabiro J." autocomplete="name" maxlength="40" />
       </div>
       <div class="auth-field">
         <label for="signupHandle">Handle</label>
-        <input type="text" id="signupHandle" name="handle" required placeholder="JABIRO CHRIS" autocomplete="username" maxlength="30" pattern="[A-Za-z0-9_]+" />
+        <input type="text" id="signupHandle" name="handle" required placeholder="JABIRO" autocomplete="username" maxlength="30" pattern="[A-Za-z0-9_]+" />
       </div>
       <div class="auth-field">
         <label for="signupEmail">Email</label>
@@ -855,18 +889,48 @@ const db = {
   },
   async createPost(body, mediaUrl){
     if (!sb) {
-      MOCK.posts.unshift({ id: Date.now(), author: MOCK.profile.name, handle: MOCK.profile.handle, time: 'now', body, likes: 0, comments: 0, reposts: 0, media: !!mediaUrl });
+      MOCK.posts.unshift({
+        id: Date.now(), author: MOCK.profile.name, handle: MOCK.profile.handle, time: 'now',
+        body, likes: 0, comments: 0, reposts: 0, media: !!mediaUrl, media_url: mediaUrl || null
+      });
       return { ok: true };
     }
     const user = await this.currentUser();
     if (!user) return { ok: false, error: 'Not logged in' };
     const { error } = await sb.from('posts').insert({
       author_id: user.id,
-      body,
+      body: body || '',
       media_url: mediaUrl || null
     });
     if (error) return { ok: false, error: error.message };
     return { ok: true };
+  },
+  async uploadPostMedia(file){
+    if (!file) return { ok: false, error: 'No file' };
+    if (!sb) {
+      // Demo: local object URL so preview + feed work offline
+      return { ok: true, url: URL.createObjectURL(file), demo: true };
+    }
+    const user = await this.currentUser();
+    if (!user) return { ok: false, error: 'Not logged in' };
+    const ext = (file.name.split('.').pop() || 'jpg').toLowerCase().replace(/[^a-z0-9]/g, '') || 'jpg';
+    const path = `${user.id}/${Date.now()}_${Math.random().toString(36).slice(2,8)}.${ext}`;
+    // Prefer "posts" bucket; fall back to "avatars" if posts bucket is missing
+    let upErr = null;
+    let publicUrl = null;
+    for (const bucket of ['posts', 'media', 'avatars']) {
+      const { error } = await sb.storage.from(bucket).upload(path, file, { upsert: false, contentType: file.type || 'image/jpeg' });
+      if (!error) {
+        const { data: pub } = sb.storage.from(bucket).getPublicUrl(path);
+        publicUrl = pub?.publicUrl || null;
+        break;
+      }
+      upErr = error;
+    }
+    if (!publicUrl) {
+      return { ok: false, error: (upErr && upErr.message) || 'Upload failed. Create a public Storage bucket named "posts".' };
+    }
+    return { ok: true, url: publicUrl };
   },
   async getNotifications(){
     if (sb) {
@@ -1412,7 +1476,7 @@ async function renderHome(){
         <button class="icon-btn" type="button" style="background:none;border:none;" aria-label="More options for post by ${p.author||'Maestro'}">⋯</button>
       </div>
       <p class="post-body">${p.body}</p>
-      ${p.media ? '<div class="post-media" role="img" aria-label="Post media attachment"></div>' : ''}
+      ${(p.media_url || p.media) ? (p.media_url ? `<div class="post-media"><img src="${p.media_url}" alt="Post media" loading="lazy" /></div>` : '<div class="post-media" role="img" aria-label="Post media attachment"></div>') : ''}
       ${p.poll ? `
         <div class="poll-card" role="group" aria-labelledby="poll-q-${p.id}">
           <div class="poll-eyebrow">Poll · 412 votes</div>
@@ -1462,20 +1526,22 @@ async function renderHome(){
         </button>
       </div>
     </section>
-    <section class="panel composer" aria-label="Create a post">
+    <section class="panel composer" aria-label="Create a post" data-composer="home">
       <div class="composer-top">
         <div class="avatar" aria-hidden="true">A</div>
         <label for="composerText" class="sr-only">What's happening in your Maestro World?</label>
-        <textarea id="composerText" class="composer-input" rows="1" placeholder="What's happening in your Maestro World?"></textarea>
+        <textarea id="composerText" class="composer-input" rows="2" placeholder="What's happening in your Maestro World?"></textarea>
       </div>
+      <div class="media-preview" id="homeMediaPreview" hidden></div>
       <div class="composer-actions">
         <div class="composer-chips">
-          <button type="button" class="chip" aria-label="Add media"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="9" cy="9" r="2"/><path d="M21 15l-5-5-9 9"/></svg>Media</button>
-          <button type="button" class="chip" aria-label="Make interactive"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M4 6h16M4 12h10M4 18h7"/></svg>Interactive</button>
-          <button type="button" class="chip ai" aria-label="Use AI Assistant"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 3l2.2 5.8L20 11l-5.8 2.2L12 19l-2.2-5.8L4 11l5.8-2.2z"/></svg>AI Assistant</button>
+          <button type="button" class="chip" id="homeMediaBtn" data-pick-media="home" aria-label="Add photo or video"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="9" cy="9" r="2"/><path d="M21 15l-5-5-9 9"/></svg>Photo</button>
+          <button type="button" class="chip" data-page="create" aria-label="Open full composer"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>Full editor</button>
+          <button type="button" class="chip ai" data-page="ai" aria-label="Use AI Assistant"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 3l2.2 5.8L20 11l-5.8 2.2L12 19l-2.2-5.8L4 11l5.8-2.2z"/></svg>AI</button>
         </div>
-        <button type="button" class="post-btn" aria-label="Publish post">Post</button>
+        <button type="button" class="post-btn" id="homePostBtn" aria-label="Publish post">Post</button>
       </div>
+      <div class="compose-status" id="homeComposeStatus"></div>
     </section>
     <div class="tabs" data-feed-tabs role="tablist" aria-label="Feed filters">
       <button type="button" class="tab active" role="tab" aria-selected="true" id="tab-foryou">For you</button>
@@ -1891,22 +1957,34 @@ function renderWorld(){
 }
 
 function renderCreate(){
+  const initial = (MOCK.profile.name || 'A')[0];
   return `
-    <div class="section-eyebrow"><span>Create</span></div>
-    <section class="panel composer" aria-label="Create a post" style="gap:18px">
-      <div class="composer-top">
-        <div class="avatar" aria-hidden="true">A</div>
-        <label for="createComposer" class="sr-only">What's happening in your Maestro World?</label>
-        <textarea id="createComposer" class="composer-input" rows="4" placeholder="What's happening in your Maestro World?" style="min-height:80px;color:var(--off-white)"></textarea>
-      </div>
-      <div class="composer-actions">
-        <div class="composer-chips">
-          <button type="button" class="chip" aria-label="Add media"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="9" cy="9" r="2"/><path d="M21 15l-5-5-9 9"/></svg>Media</button>
-          <button type="button" class="chip" aria-label="Make interactive"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M4 6h16M4 12h10M4 18h7"/></svg>Interactive</button>
-          <button type="button" class="chip ai" aria-label="Use AI Assistant"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 3l2.2 5.8L20 11l-5.8 2.2L12 19l-2.2-5.8L4 11l5.8-2.2z"/></svg>AI Assistant</button>
+    <div class="section-eyebrow"><span>Create a post</span></div>
+    <section class="panel compose-hero" aria-label="Create a post" data-composer="create">
+      <div style="display:flex;align-items:center;gap:12px">
+        <div class="avatar" aria-hidden="true">${initial}</div>
+        <div>
+          <div style="font-weight:700;font-size:15px">${MOCK.profile.name || 'You'}</div>
+          <div style="font-size:12px;color:var(--muted-2);font-family:var(--font-mono)">${MOCK.profile.handle || ''}</div>
         </div>
-        <button type="button" class="post-btn" id="createPostBtn" aria-label="Publish post">Post</button>
       </div>
+      <label for="createComposer" class="sr-only">Write your post</label>
+      <textarea id="createComposer" class="composer-input" rows="5" placeholder="Share an update, drop a photo, or tell the community what you're building…" style="min-height:120px;color:var(--off-white)"></textarea>
+
+      <div class="media-preview" id="createMediaPreview" hidden></div>
+      <div class="media-drop" id="createMediaDrop" data-pick-media="create" role="button" tabindex="0" aria-label="Add photo or video">
+        <strong>+ Add photo or video</strong>
+        Tap to upload · PNG, JPG, GIF, MP4
+      </div>
+
+      <div class="composer-actions" style="margin-top:4px">
+        <div class="composer-chips">
+          <button type="button" class="chip" data-pick-media="create" aria-label="Add media"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="9" cy="9" r="2"/><path d="M21 15l-5-5-9 9"/></svg>Media</button>
+          <button type="button" class="chip ai" data-page="ai" aria-label="Ask AI for caption ideas"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 3l2.2 5.8L20 11l-5.8 2.2L12 19l-2.2-5.8L4 11l5.8-2.2z"/></svg>Caption ideas</button>
+        </div>
+        <button type="button" class="post-btn" id="createPostBtn" aria-label="Publish post">Publish</button>
+      </div>
+      <div class="compose-status" id="createComposeStatus">Your post will appear on Home for you and your friends.</div>
     </section>
     <div class="panel" style="padding:16px;display:flex;flex-direction:column;gap:10px">
       <div class="section-eyebrow" style="padding:0"><span>Quick starts</span></div>
@@ -2530,17 +2608,6 @@ function attachPageHandlers(){
       });
     });
 
-    // Create post
-    const createBtn = root.querySelector('#createPostBtn');
-    const createText = root.querySelector('#createComposer');
-    if (createBtn && createText){
-      createBtn.addEventListener('click', ()=>{
-        if (!createText.value.trim()) { createText.focus(); return; }
-        createText.value = '';
-        showPage('home');
-      });
-    }
-
     // Maestro AI chat
     const aiSend = root.querySelector('#aiSend');
     const aiInput = root.querySelector('#aiInput');
@@ -2623,42 +2690,130 @@ function attachPageHandlers(){
       });
     });
 
-    // Home composer → real post
-    const homePostBtn = root.querySelector('.composer .post-btn');
-    const homeComposer = root.querySelector('#composerText');
-    if (homePostBtn && homeComposer) {
-      homePostBtn.addEventListener('click', async () => {
-        const body = homeComposer.value.trim();
-        if (!body) { homeComposer.focus(); return; }
-        homePostBtn.disabled = true;
-        const res = await db.createPost(body);
-        homePostBtn.disabled = false;
-        if (res.ok) {
-          homeComposer.value = '';
-          showPage('home');
-        } else {
-          alert(res.error || 'Could not post. Are you logged in?');
+    // ——— Compose / post with media (Home + Create) ———
+    if (!window.__maestroComposeFiles) window.__maestroComposeFiles = { home: null, create: null };
+
+    function setComposeStatus(id, msg, kind){
+      const el = root.querySelector(id);
+      if (!el) return;
+      el.textContent = msg || '';
+      el.classList.remove('err', 'ok');
+      if (kind) el.classList.add(kind);
+    }
+
+    function renderMediaPreview(scope, file){
+      const preview = root.querySelector(scope === 'home' ? '#homeMediaPreview' : '#createMediaPreview');
+      const drop = root.querySelector('#createMediaDrop');
+      if (!preview) return;
+      preview.innerHTML = '';
+      if (!file) {
+        preview.hidden = true;
+        window.__maestroComposeFiles[scope] = null;
+        if (drop && scope === 'create') drop.hidden = false;
+        return;
+      }
+      window.__maestroComposeFiles[scope] = file;
+      const url = URL.createObjectURL(file);
+      const isVideo = (file.type || '').startsWith('video/');
+      preview.hidden = false;
+      if (drop && scope === 'create') drop.hidden = true;
+      preview.innerHTML = `
+        ${isVideo ? `<video src="${url}" controls playsinline style="width:100%;max-height:280px"></video>` : `<img src="${url}" alt="Selected media" />`}
+        <button type="button" class="rm" data-clear-media="${scope}" aria-label="Remove media">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M18 6 6 18M6 6l12 12"/></svg>
+        </button>`;
+      preview.querySelector('[data-clear-media]')?.addEventListener('click', () => renderMediaPreview(scope, null));
+    }
+
+    function pickMedia(scope){
+      let inp = document.getElementById('postMediaFileInput');
+      if (!inp) {
+        inp = document.createElement('input');
+        inp.type = 'file';
+        inp.accept = 'image/*,video/*';
+        inp.id = 'postMediaFileInput';
+        inp.hidden = true;
+        document.body.appendChild(inp);
+      }
+      inp.onchange = () => {
+        const file = inp.files && inp.files[0];
+        inp.value = '';
+        if (!file) return;
+        if (file.size > 25 * 1024 * 1024) {
+          alert('File is too large (max 25MB).');
+          return;
+        }
+        renderMediaPreview(scope, file);
+        const chip = root.querySelector(`[data-pick-media="${scope}"].chip`);
+        if (chip) chip.classList.add('active');
+      };
+      inp.click();
+    }
+
+    root.querySelectorAll('[data-pick-media]').forEach(el => {
+      el.addEventListener('click', (e) => {
+        e.preventDefault();
+        pickMedia(el.getAttribute('data-pick-media') || 'create');
+      });
+      el.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          pickMedia(el.getAttribute('data-pick-media') || 'create');
+        }
+      });
+    });
+
+    // Drag & drop on Create page
+    const dropZone = root.querySelector('#createMediaDrop');
+    if (dropZone) {
+      ['dragenter','dragover'].forEach(ev => dropZone.addEventListener(ev, e => { e.preventDefault(); dropZone.classList.add('drag'); }));
+      ['dragleave','drop'].forEach(ev => dropZone.addEventListener(ev, e => { e.preventDefault(); dropZone.classList.remove('drag'); }));
+      dropZone.addEventListener('drop', e => {
+        const file = e.dataTransfer?.files?.[0];
+        if (file && (file.type.startsWith('image/') || file.type.startsWith('video/'))) {
+          renderMediaPreview('create', file);
         }
       });
     }
 
-    // Create page post
-    const createBtn2 = root.querySelector('#createPostBtn');
-    const createText2 = root.querySelector('#createComposer');
-    if (createBtn2 && createText2 && !createBtn2.dataset.bound) {
-      createBtn2.dataset.bound = '1';
-      createBtn2.addEventListener('click', async () => {
-        const body = createText2.value.trim();
-        if (!body) { createText2.focus(); return; }
-        createBtn2.disabled = true;
-        const res = await db.createPost(body);
-        createBtn2.disabled = false;
-        if (res.ok) {
-          createText2.value = '';
-          showPage('home');
-        } else alert(res.error || 'Could not post');
-      });
+    async function publishPost(scope){
+      const isHome = scope === 'home';
+      const textarea = root.querySelector(isHome ? '#composerText' : '#createComposer');
+      const btn = root.querySelector(isHome ? '#homePostBtn' : '#createPostBtn');
+      const statusId = isHome ? '#homeComposeStatus' : '#createComposeStatus';
+      const body = (textarea?.value || '').trim();
+      const file = window.__maestroComposeFiles?.[scope] || null;
+      if (!body && !file) {
+        textarea?.focus();
+        setComposeStatus(statusId, 'Write something or add a photo first.', 'err');
+        return;
+      }
+      if (btn) { btn.disabled = true; btn.textContent = file ? 'Uploading…' : 'Posting…'; }
+      setComposeStatus(statusId, file ? 'Uploading media…' : 'Publishing…', '');
+      let mediaUrl = null;
+      if (file) {
+        const up = await db.uploadPostMedia(file);
+        if (!up.ok) {
+          if (btn) { btn.disabled = false; btn.textContent = isHome ? 'Post' : 'Publish'; }
+          setComposeStatus(statusId, up.error || 'Upload failed', 'err');
+          return;
+        }
+        mediaUrl = up.url;
+      }
+      if (btn) btn.textContent = 'Publishing…';
+      const res = await db.createPost(body || (mediaUrl ? ' ' : ''), mediaUrl);
+      if (btn) { btn.disabled = false; btn.textContent = isHome ? 'Post' : 'Publish'; }
+      if (!res.ok) {
+        setComposeStatus(statusId, res.error || 'Could not post. Are you logged in?', 'err');
+        return;
+      }
+      window.__maestroComposeFiles[scope] = null;
+      setComposeStatus(statusId, 'Posted! Opening Home…', 'ok');
+      setTimeout(() => showPage('home'), 350);
     }
+
+    root.querySelector('#homePostBtn')?.addEventListener('click', () => publishPost('home'));
+    root.querySelector('#createPostBtn')?.addEventListener('click', () => publishPost('create'));
 
     // Avatar file input on profile edit
     const changeAvatarBtn = root.querySelector('#changeAvatarBtn');
