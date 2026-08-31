@@ -764,28 +764,24 @@ const db = {
     if (sb) {
       const user = await this.currentUser();
       if (!user) return [];
-      const { data: parts, error } = await sb.from('conversation_members')
-        .select('conversation_id')
-        .eq('user_id', user.id);
-      if (error || !parts || !parts.length) return [];
-      const ids = parts.map(p => p.conversation_id);
-      const { data: convos } = await sb.from('conversations')
-        .select('id, updated_at')
-        .in('id', ids)
-        .order('updated_at', { ascending: false });
-      if (!convos) return [];
+
+      // Use a SECURITY DEFINER RPC for the inbox.  The browser should not
+      // need to read another person's conversation_members row directly.
+      const { data: rows, error } = await sb.rpc('get_my_direct_conversations');
+      if (error) {
+        console.warn('Could not load conversations:', error.message);
+        return [];
+      }
+
       const result = [];
-      for (const c of convos) {
-        const { data: members } = await sb.from('conversation_members')
-          .select('user_id, profiles(id, name, handle, avatar_url)')
-          .eq('conversation_id', c.id);
-        const other = (members || []).find(m => m.user_id !== user.id);
-        const otherProfile = other?.profiles || { name: 'User', handle: '', id: other?.user_id };
-        const { data: msgs } = await sb.from('messages')
+      for (const c of (rows || [])) {
+        const { data: msgs, error: msgErr } = await sb.from('messages')
           .select('id, body, sender_id, created_at')
-          .eq('conversation_id', c.id)
+          .eq('conversation_id', c.conversation_id)
           .order('created_at', { ascending: true })
           .limit(100);
+        if (msgErr) console.warn('Could not load conversation messages:', msgErr.message);
+
         const messages = (msgs || []).map(m => ({
           id: m.id,
           from: m.sender_id === user.id ? 'me' : 'them',
@@ -794,9 +790,10 @@ const db = {
         }));
         const last = messages[messages.length - 1];
         result.push({
-          id: c.id,
-          name: otherProfile.name || 'User',
-          other_id: otherProfile.id || other?.user_id,
+          id: c.conversation_id,
+          name: c.other_name || 'User',
+          other_id: c.other_user_id,
+          avatar_url: c.other_avatar_url || '',
           online: false,
           unread: 0,
           preview: last ? last.body : 'No messages yet',
@@ -848,28 +845,17 @@ const db = {
     };
   },
   async getOrCreateConversation(otherUserId){
-    if (!sb) return { ok: false, error: 'Not connected' };
+    if (!sb) return { ok: false, error: 'Supabase is not connected' };
     const user = await this.currentUser();
     if (!user) return { ok: false, error: 'Not logged in' };
-    if (user.id === otherUserId) return { ok: false, error: 'Invalid user' };
-    // Find existing 1:1 conversation
-    const { data: myParts } = await sb.from('conversation_members')
-      .select('conversation_id')
-      .eq('user_id', user.id);
-    const myIds = (myParts || []).map(p => p.conversation_id);
-    if (myIds.length) {
-      const { data: shared } = await sb.from('conversation_members')
-        .select('conversation_id')
-        .eq('user_id', otherUserId)
-        .in('conversation_id', myIds);
-      if (shared && shared.length) {
-        return { ok: true, id: shared[0].conversation_id };
-      }
-    }
-    // Create the conversation atomically through the Supabase RPC.
-    // This avoids RLS/returning issues when the conversation has no members yet.
+    if (!otherUserId || user.id === otherUserId) return { ok: false, error: 'Invalid recipient' };
+
+    // The server-side function safely finds an existing 1:1 chat or creates
+    // one and adds both users. This avoids client-side membership/RLS races.
     const { data: rpcId, error: rpcErr } = await sb.rpc('create_direct_conversation', { target_user_id: otherUserId });
-    if (rpcErr || !rpcId) return { ok: false, error: rpcErr?.message || 'Could not create chat' };
+    if (rpcErr || !rpcId) {
+      return { ok: false, error: rpcErr?.message || 'Could not create chat' };
+    }
     return { ok: true, id: rpcId };
   },
   async sendMessage(conversationId, body){
