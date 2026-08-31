@@ -629,6 +629,34 @@ if (supabaseReady && window.supabase) {
 }
 document.getElementById('presenceDot')?.classList.toggle('offline', !sb);
 
+// Real-time messaging: subscribe to messages for the signed-in user.
+let messageRealtimeChannel = null;
+async function startMessageRealtime(){
+  if (!sb) return;
+  if (messageRealtimeChannel) { try { await sb.removeChannel(messageRealtimeChannel); } catch(e) {} }
+  const user = await db.currentUser();
+  if (!user) return;
+  messageRealtimeChannel = sb.channel('maestro-messages-' + user.id)
+    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, payload => {
+      const msg = payload.new;
+      if (!msg || !activeConversationId || msg.conversation_id !== activeConversationId) return;
+      if (msg.sender_id === user.id) return;
+      const body = document.querySelector('[data-thread-body]');
+      if (!body) return;
+      const empty = body.querySelector('.search-empty');
+      if (empty) empty.remove();
+      const el = document.createElement('div');
+      el.className = 'bubble them';
+      el.setAttribute('role','listitem');
+      el.textContent = msg.body || '';
+      const t = document.createElement('time');
+      t.textContent = msg.created_at ? new Date(msg.created_at).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '';
+      el.appendChild(t); body.appendChild(el); body.scrollTop = body.scrollHeight;
+    })
+    .subscribe();
+}
+
+
 const db = {
   async currentUser(){
     if (!sb) return null;
@@ -798,15 +826,11 @@ const db = {
         return { ok: true, id: shared[0].conversation_id };
       }
     }
-    const { data: conv, error: cErr } = await sb.from('conversations')
-      .insert({}).select('id').single();
-    if (cErr || !conv) return { ok: false, error: cErr?.message || 'Could not create chat' };
-    const { error: mErr } = await sb.from('conversation_members').insert([
-      { conversation_id: conv.id, user_id: user.id },
-      { conversation_id: conv.id, user_id: otherUserId }
-    ]);
-    if (mErr) return { ok: false, error: mErr.message };
-    return { ok: true, id: conv.id };
+    // Create the conversation atomically through the Supabase RPC.
+    // This avoids RLS/returning issues when the conversation has no members yet.
+    const { data: rpcId, error: rpcErr } = await sb.rpc('create_direct_conversation', { target_user_id: otherUserId });
+    if (rpcErr || !rpcId) return { ok: false, error: rpcErr?.message || 'Could not create chat' };
+    return { ok: true, id: rpcId };
   },
   async sendMessage(conversationId, body){
     if (sb) {
@@ -2473,6 +2497,36 @@ document.addEventListener('keydown', (e)=>{
   }
 });
 
+let realtimeChannels = [];
+async function startRealtime(){
+  if (!sb) return;
+  realtimeChannels.forEach(ch => sb.removeChannel(ch)); realtimeChannels = [];
+  const user = await db.currentUser();
+  if (!user) return;
+  const msgChannel = sb.channel('maestro-direct-messages-' + user.id)
+    .on('postgres_changes', {event:'INSERT', schema:'public', table:'messages'}, payload => {
+      if (!payload.new) return;
+      const m = payload.new;
+      if (m.conversation_id !== activeConversationId || m.sender_id === user.id) return;
+      const body = document.querySelector('[data-thread-body]');
+      if (!body) return;
+      const empty = body.querySelector('.search-empty'); if (empty) empty.remove();
+      const el = document.createElement('div'); el.className='bubble them'; el.setAttribute('role','listitem');
+      el.textContent = m.body || '';
+      const time = document.createElement('time'); time.textContent = m.created_at ? new Date(m.created_at).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '';
+      el.appendChild(time); body.appendChild(el); body.scrollTop = body.scrollHeight;
+      const composer = document.querySelector('[data-msg-input]'); if (composer) composer.focus();
+    })
+    .subscribe();
+  realtimeChannels.push(msgChannel);
+  const notifChannel = sb.channel('maestro-notifications-' + user.id)
+    .on('postgres_changes', {event:'INSERT', schema:'public', table:'notifications', filter:'user_id=eq.'+user.id}, () => {
+      const badge = document.getElementById('notifBadge'); if (badge) badge.classList.remove('hide');
+      const ping = document.getElementById('topPing'); if (ping) ping.classList.remove('hide');
+    }).subscribe();
+  realtimeChannels.push(notifChannel);
+}
+
 function setupFullscreenButton(btn){
   if (!btn) return;
   if (!document.fullscreenEnabled) { btn.style.display = 'none'; return; }
@@ -2535,6 +2589,7 @@ function enterApp(userMeta){
   if (appRoot) appRoot.style.visibility = 'visible';
   history.replaceState({ page:'home' }, '', '#home');
   showPage(location.hash && location.hash !== '#login' ? location.hash.slice(1) : 'home');
+  if (sb) startRealtime();
 }
 
 function stayOnAuth(){
@@ -2641,21 +2696,36 @@ async function handleSignup(e){
 document.getElementById('loginForm').addEventListener('submit', handleLogin);
 document.getElementById('signupForm').addEventListener('submit', handleSignup);
 
-// Boot: restore session or show auth
-(function boot(){
+// Boot: use Supabase's real session as the source of truth.
+(async function boot(){
   if (appRoot) appRoot.style.visibility = 'hidden';
-  let session = null;
-  try { session = JSON.parse(localStorage.getItem('maestro_session') || 'null'); } catch(_){}
-  if (session && (session.mode === 'guest' || session.mode === 'demo' || session.mode === 'user')) {
-    enterApp(session.mode === 'guest' ? null : {
-      name: session.name,
-      handle: session.handle,
-      email: session.email
-    });
-  } else {
+  if (supabaseReady && sb) {
+    const { data: { session } } = await sb.auth.getSession();
+    if (session?.user) {
+      const u=session.user, meta=u.user_metadata||{};
+      const name=meta.name || u.email?.split('@')[0] || 'User';
+      const handle=meta.handle || u.email?.split('@')[0] || 'user';
+      await db.ensureProfile({id:u.id,name,handle,email:u.email});
+      localStorage.setItem('maestro_session', JSON.stringify({mode:'user',email:u.email,name,handle}));
+      enterApp({name,handle,email:u.email});
+      await startRealtime();
+      return;
+    }
+    localStorage.removeItem('maestro_session');
     stayOnAuth();
+    return;
   }
+  let session=null; try { session=JSON.parse(localStorage.getItem('maestro_session')||'null'); } catch(_){}
+  if (session && (session.mode==='guest'||session.mode==='demo')) enterApp(session.mode==='guest'?null:{name:session.name,handle:session.handle,email:session.email});
+  else stayOnAuth();
 })();
+
+if (sb) {
+  sb.auth.onAuthStateChange(async (event, session) => {
+    if (session?.user) { await startRealtime(); }
+    else if (event === 'SIGNED_OUT') { realtimeChannels.forEach(ch=>sb.removeChannel(ch)); realtimeChannels=[]; stayOnAuth(); }
+  });
+}
 </script>
 </body>
 </html>
