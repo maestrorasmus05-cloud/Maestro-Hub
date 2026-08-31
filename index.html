@@ -617,8 +617,8 @@
 </div>
 
 <script>
-const SUPABASE_URL = 'https://rceymoswrrnrmbezzcwn.supabase.co';
-const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJjZXltb3N3cnJucm1iZXp6Y3duIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODgxNTMxMDgsImV4cCI6MjEwMzcyOTEwOH0.xciqSdyYpNLA6o-Mbz9rUPN69OWMRIxEQlGf3PqPag8';
+const SUPABASE_URL = 'YOUR_SUPABASE_URL';
+const SUPABASE_ANON_KEY = 'YOUR_SUPABASE_ANON_KEY';
 
 let sb = null;
 const supabaseReady = SUPABASE_URL.startsWith('http') && SUPABASE_ANON_KEY !== 'YOUR_SUPABASE_ANON_KEY';
@@ -628,51 +628,239 @@ if (supabaseReady && window.supabase) {
 document.getElementById('presenceDot')?.classList.toggle('offline', !sb);
 
 const db = {
+  async currentUser(){
+    if (!sb) return null;
+    const { data: { user } } = await sb.auth.getUser();
+    return user || null;
+  },
   async getFeed(){
     if (sb) {
+      const user = await this.currentUser();
+      // Public posts + posts from accepted friends + own posts
       const { data, error } = await sb.from('posts')
-        .select('id, body, media_url, created_at, likes, comments, profiles(name, handle, avatar_url)')
-        .order('created_at', { ascending:false }).limit(20);
-      if (!error && data) return data;
+        .select('id, body, media_url, created_at, likes, comments, author_id, profiles(id, name, handle, avatar_url)')
+        .order('created_at', { ascending:false }).limit(40);
+      if (!error && data) {
+        return data.map(p => ({
+          id: p.id,
+          author: p.profiles?.name || 'User',
+          handle: p.profiles?.handle || '',
+          author_id: p.author_id,
+          avatar_url: p.profiles?.avatar_url,
+          time: p.created_at ? new Date(p.created_at).toLocaleString([], {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'}) : '',
+          body: p.body,
+          likes: p.likes || 0,
+          comments: p.comments || 0,
+          reposts: 0,
+          media: !!p.media_url,
+          media_url: p.media_url
+        }));
+      }
     }
     return MOCK.posts;
   },
+  async getPostsByAuthor(authorId){
+    if (sb && authorId) {
+      const { data, error } = await sb.from('posts')
+        .select('id, body, media_url, created_at, likes, comments, author_id, profiles(name, handle, avatar_url)')
+        .eq('author_id', authorId)
+        .order('created_at', { ascending:false }).limit(50);
+      if (!error && data) {
+        return data.map(p => ({
+          id: p.id,
+          author: p.profiles?.name || 'User',
+          handle: p.profiles?.handle || '',
+          author_id: p.author_id,
+          time: p.created_at ? new Date(p.created_at).toLocaleString([], {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'}) : '',
+          body: p.body,
+          likes: p.likes || 0,
+          comments: p.comments || 0,
+          reposts: 0,
+          media: !!p.media_url,
+          media_url: p.media_url
+        }));
+      }
+    }
+    return [];
+  },
+  async createPost(body, mediaUrl){
+    if (!sb) {
+      MOCK.posts.unshift({ id: Date.now(), author: MOCK.profile.name, handle: MOCK.profile.handle, time: 'now', body, likes: 0, comments: 0, reposts: 0, media: !!mediaUrl });
+      return { ok: true };
+    }
+    const user = await this.currentUser();
+    if (!user) return { ok: false, error: 'Not logged in' };
+    const { error } = await sb.from('posts').insert({
+      author_id: user.id,
+      body,
+      media_url: mediaUrl || null
+    });
+    if (error) return { ok: false, error: error.message };
+    return { ok: true };
+  },
   async getNotifications(){
     if (sb) {
-      const { data, error } = await sb.from('notifications').select('*').order('created_at', { ascending:false });
-      if (!error && data) return data;
+      const user = await this.currentUser();
+      if (user) {
+        const { data, error } = await sb.from('notifications')
+          .select('*')
+          .eq('user_id', user.id)
+          .order('created_at', { ascending:false })
+          .limit(50);
+        if (!error && data) {
+          return data.map(n => ({
+            id: n.id,
+            type: n.type,
+            actor: n.actor_name || n.actor || 'Someone',
+            actor_id: n.actor_id,
+            text: n.text,
+            time: n.created_at ? relativeTime(n.created_at) : '',
+            unread: !n.read,
+            meta: n.meta || {}
+          }));
+        }
+      }
     }
     return MOCK.notifications;
   },
   async markNotificationsRead(){
-    if (sb) { await sb.from('notifications').update({ read:true }).eq('read', false); }
+    if (sb) {
+      const user = await this.currentUser();
+      if (user) await sb.from('notifications').update({ read: true }).eq('user_id', user.id).eq('read', false);
+    }
     MOCK.notifications.forEach(n => n.unread = false);
   },
   async getConversations(){
     if (sb) {
-      const { data, error } = await sb.from('conversations').select('*, messages(*)').order('updated_at', { ascending:false });
-      if (!error && data) return data;
+      const user = await this.currentUser();
+      if (!user) return [];
+      const { data: parts, error } = await sb.from('conversation_members')
+        .select('conversation_id')
+        .eq('user_id', user.id);
+      if (error || !parts || !parts.length) return [];
+      const ids = parts.map(p => p.conversation_id);
+      const { data: convos } = await sb.from('conversations')
+        .select('id, updated_at')
+        .in('id', ids)
+        .order('updated_at', { ascending: false });
+      if (!convos) return [];
+      const result = [];
+      for (const c of convos) {
+        const { data: members } = await sb.from('conversation_members')
+          .select('user_id, profiles(id, name, handle, avatar_url)')
+          .eq('conversation_id', c.id);
+        const other = (members || []).find(m => m.user_id !== user.id);
+        const otherProfile = other?.profiles || { name: 'User', handle: '', id: other?.user_id };
+        const { data: msgs } = await sb.from('messages')
+          .select('id, body, sender_id, created_at')
+          .eq('conversation_id', c.id)
+          .order('created_at', { ascending: true })
+          .limit(100);
+        const messages = (msgs || []).map(m => ({
+          id: m.id,
+          from: m.sender_id === user.id ? 'me' : 'them',
+          body: m.body,
+          time: m.created_at ? new Date(m.created_at).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}) : ''
+        }));
+        const last = messages[messages.length - 1];
+        result.push({
+          id: c.id,
+          name: otherProfile.name || 'User',
+          other_id: otherProfile.id || other?.user_id,
+          online: false,
+          unread: 0,
+          preview: last ? last.body : 'No messages yet',
+          messages
+        });
+      }
+      return result;
     }
     return MOCK.conversations;
   },
-  async sendMessage(conversationId, body){
-    if (sb) {
-      const { data: { user } } = await sb.auth.getUser();
-      await sb.from('messages').insert({ conversation_id: conversationId, sender_id: user?.id, body });
-      return;
-    }
-    const convo = MOCK.conversations.find(c => c.id === conversationId);
-    convo.messages.push({ from:'me', body, time: nowTime() });
-  },
-  async getProfile(){
-    if (sb) {
-      const { data: { user } } = await sb.auth.getUser();
-      if (user) {
-        const { data } = await sb.from('profiles').select('*').eq('id', user.id).single();
-        if (data) return data;
+  async getOrCreateConversation(otherUserId){
+    if (!sb) return { ok: false, error: 'Not connected' };
+    const user = await this.currentUser();
+    if (!user) return { ok: false, error: 'Not logged in' };
+    if (user.id === otherUserId) return { ok: false, error: 'Invalid user' };
+    // Find existing 1:1 conversation
+    const { data: myParts } = await sb.from('conversation_members')
+      .select('conversation_id')
+      .eq('user_id', user.id);
+    const myIds = (myParts || []).map(p => p.conversation_id);
+    if (myIds.length) {
+      const { data: shared } = await sb.from('conversation_members')
+        .select('conversation_id')
+        .eq('user_id', otherUserId)
+        .in('conversation_id', myIds);
+      if (shared && shared.length) {
+        return { ok: true, id: shared[0].conversation_id };
       }
     }
-    return MOCK.profile;
+    const { data: conv, error: cErr } = await sb.from('conversations')
+      .insert({}).select('id').single();
+    if (cErr || !conv) return { ok: false, error: cErr?.message || 'Could not create chat' };
+    const { error: mErr } = await sb.from('conversation_members').insert([
+      { conversation_id: conv.id, user_id: user.id },
+      { conversation_id: conv.id, user_id: otherUserId }
+    ]);
+    if (mErr) return { ok: false, error: mErr.message };
+    return { ok: true, id: conv.id };
+  },
+  async sendMessage(conversationId, body){
+    if (sb) {
+      const user = await this.currentUser();
+      if (!user) return { ok: false, error: 'Not logged in' };
+      const { data, error } = await sb.from('messages').insert({
+        conversation_id: conversationId,
+        sender_id: user.id,
+        body
+      }).select('id, created_at').single();
+      if (error) return { ok: false, error: error.message };
+      await sb.from('conversations').update({ updated_at: new Date().toISOString() }).eq('id', conversationId);
+      return {
+        ok: true,
+        message: {
+          id: data.id,
+          from: 'me',
+          body,
+          time: new Date(data.created_at || Date.now()).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})
+        }
+      };
+    }
+    const convo = MOCK.conversations.find(c => c.id === conversationId);
+    if (convo) {
+      const msg = { from:'me', body, time: nowTime() };
+      convo.messages.push(msg);
+      convo.preview = body;
+      return { ok: true, message: msg };
+    }
+    return { ok: false, error: 'Conversation not found' };
+  },
+  async getProfile(userId){
+    if (sb) {
+      const user = await this.currentUser();
+      const id = userId || user?.id;
+      if (id) {
+        const { data } = await sb.from('profiles').select('*').eq('id', id).single();
+        if (data) {
+          const posts = await this.getPostsByAuthor(id);
+          return {
+            id: data.id,
+            name: data.name,
+            handle: data.handle,
+            bio: data.bio || '',
+            location: data.location || '',
+            website: data.website || '',
+            avatar_url: data.avatar_url || '',
+            posts: posts.length,
+            followers: data.followers_count || 0,
+            following: data.following_count || 0,
+            isSelf: user && user.id === data.id
+          };
+        }
+      }
+    }
+    return { ...MOCK.profile, isSelf: true };
   },
   async search(query){
     if (sb) {
@@ -713,8 +901,125 @@ const db = {
     const { error } = await sb.from('profiles').upsert(row, { onConflict: 'id' });
     if (error) console.warn('ensureProfile', error.message);
     return row;
+  },
+  async getFollowStatus(targetId){
+    if (!sb || !targetId) return 'none';
+    const user = await this.currentUser();
+    if (!user || user.id === targetId) return 'self';
+    const { data } = await sb.from('follows')
+      .select('status')
+      .eq('follower_id', user.id)
+      .eq('following_id', targetId)
+      .maybeSingle();
+    if (!data) return 'none';
+    return data.status; // pending | accepted
+  },
+  async requestFollow(targetId){
+    if (!sb) return { ok: false, error: 'Supabase not connected' };
+    const user = await this.currentUser();
+    if (!user) return { ok: false, error: 'Not logged in' };
+    if (user.id === targetId) return { ok: false, error: 'Cannot follow yourself' };
+    const me = await this.getProfile(user.id);
+    const { error } = await sb.from('follows').upsert({
+      follower_id: user.id,
+      following_id: targetId,
+      status: 'pending'
+    }, { onConflict: 'follower_id,following_id' });
+    if (error) return { ok: false, error: error.message };
+    // Notify target
+    await sb.from('notifications').insert({
+      user_id: targetId,
+      type: 'follow_request',
+      actor_id: user.id,
+      actor_name: me.name || 'Someone',
+      text: 'requested to follow you',
+      read: false,
+      meta: { follower_id: user.id }
+    });
+    return { ok: true, status: 'pending' };
+  },
+  async acceptFollow(followerId){
+    if (!sb) return { ok: false };
+    const user = await this.currentUser();
+    if (!user) return { ok: false, error: 'Not logged in' };
+    const { error } = await sb.from('follows')
+      .update({ status: 'accepted' })
+      .eq('follower_id', followerId)
+      .eq('following_id', user.id);
+    if (error) return { ok: false, error: error.message };
+    const me = await this.getProfile(user.id);
+    await sb.from('notifications').insert({
+      user_id: followerId,
+      type: 'follow_accepted',
+      actor_id: user.id,
+      actor_name: me.name || 'Someone',
+      text: 'accepted your follow request',
+      read: false
+    });
+    // mark related request notifs read
+    await sb.from('notifications').update({ read: true })
+      .eq('user_id', user.id)
+      .eq('type', 'follow_request')
+      .eq('actor_id', followerId);
+    return { ok: true };
+  },
+  async rejectFollow(followerId){
+    if (!sb) return { ok: false };
+    const user = await this.currentUser();
+    if (!user) return { ok: false };
+    await sb.from('follows').delete()
+      .eq('follower_id', followerId)
+      .eq('following_id', user.id)
+      .eq('status', 'pending');
+    await sb.from('notifications').update({ read: true })
+      .eq('user_id', user.id)
+      .eq('type', 'follow_request')
+      .eq('actor_id', followerId);
+    return { ok: true };
+  },
+  async unfollow(targetId){
+    if (!sb) return { ok: false };
+    const user = await this.currentUser();
+    if (!user) return { ok: false };
+    await sb.from('follows').delete()
+      .eq('follower_id', user.id)
+      .eq('following_id', targetId);
+    return { ok: true };
+  },
+  async uploadAvatar(file){
+    if (!sb) return { ok: false, error: 'Supabase not connected' };
+    const user = await this.currentUser();
+    if (!user) return { ok: false, error: 'Not logged in' };
+    const ext = (file.name.split('.').pop() || 'jpg').toLowerCase();
+    const path = `${user.id}/avatar.${ext}`;
+    const { error: upErr } = await sb.storage.from('avatars').upload(path, file, { upsert: true, contentType: file.type });
+    if (upErr) return { ok: false, error: upErr.message };
+    const { data: pub } = sb.storage.from('avatars').getPublicUrl(path);
+    const url = pub?.publicUrl + '?t=' + Date.now();
+    await sb.from('profiles').update({ avatar_url: url }).eq('id', user.id);
+    return { ok: true, url };
+  },
+  async updateProfileFields(fields){
+    if (!sb) {
+      Object.assign(MOCK.profile, fields);
+      return { ok: true };
+    }
+    const user = await this.currentUser();
+    if (!user) return { ok: false, error: 'Not logged in' };
+    const { error } = await sb.from('profiles').update(fields).eq('id', user.id);
+    if (error) return { ok: false, error: error.message };
+    return { ok: true };
   }
 };
+
+function relativeTime(iso){
+  const d = new Date(iso);
+  const s = Math.floor((Date.now() - d.getTime()) / 1000);
+  if (s < 60) return s + 's';
+  if (s < 3600) return Math.floor(s/60) + 'm';
+  if (s < 86400) return Math.floor(s/3600) + 'h';
+  return Math.floor(s/86400) + 'd';
+}
 
 function nowTime(){ return new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}); }
 
@@ -875,20 +1180,28 @@ function renderExplore(){
   `;
 }
 
-function renderMessages(activeId){
-  const convos = MOCK.conversations;
+async function renderMessages(activeId){
+  const convos = await db.getConversations();
+  if (!convos.length) {
+    return `
+      <div class="section-eyebrow"><span>Messages</span></div>
+      <div class="panel search-empty">
+        No conversations yet.<br/><br/>
+        Open a <b>friend’s profile</b> and tap <b>Message</b> to start chatting.
+      </div>`;
+  }
   const active = convos.find(c => c.id === activeId) || convos[0];
   activeConversationId = active.id;
   const listHtml = convos.map(c => `
-    <button type="button" class="msg-list-item ${c.id===active.id?'active':''}" data-convo="${c.id}" aria-label="Conversation with ${c.name}${c.unread?', '+c.unread+' unread':''}" ${c.id===active.id?'aria-current="true"':''}>
-      <div class="avatar" aria-hidden="true">${c.name[0]}</div>
+    <button type="button" class="msg-list-item ${c.id===active.id?'active':''}" data-convo="${c.id}" aria-label="Conversation with ${c.name}">
+      <div class="avatar" aria-hidden="true">${(c.name||'?')[0]}</div>
       <div class="txt">
         <div class="t"><span>${c.name}</span><time>${c.messages[c.messages.length-1]?.time||''}</time></div>
-        <div class="p">${c.preview}</div>
+        <div class="p">${c.preview||''}</div>
       </div>
       ${c.unread ? '<span class="unread" aria-hidden="true"></span>' : ''}
     </button>`).join('');
-  const bubbles = active.messages.map(m => `<div class="bubble ${m.from==='me'?'me':'them'}" role="listitem">${m.body}<time>${m.time}</time></div>`).join('');
+  const bubbles = (active.messages||[]).map(m => `<div class="bubble ${m.from==='me'?'me':'them'}" role="listitem">${m.body}<time>${m.time||''}</time></div>`).join('');
   return `
     <div class="section-eyebrow"><span>Messages</span></div>
     <div class="panel messages-layout">
@@ -901,10 +1214,10 @@ function renderMessages(activeId){
           <b>${active.name}</b>
         </div>
         <div class="thread-head">
-          <div class="avatar" aria-hidden="true">${active.name[0]}</div>
-          <div><div class="t">${active.name}</div><div class="s">${active.online?'● Online':'Offline'}</div></div>
+          <div class="avatar" aria-hidden="true">${(active.name||'?')[0]}</div>
+          <div><div class="t">${active.name}</div><div class="s">Chat</div></div>
         </div>
-        <div class="thread-body" data-thread-body role="list" aria-live="polite">${bubbles}</div>
+        <div class="thread-body" data-thread-body role="list" aria-live="polite">${bubbles || '<div class="search-empty" style="padding:20px">Say hello 👋</div>'}</div>
         <div class="thread-input">
           <label for="msgInput" class="sr-only">Write a message</label>
           <input type="text" id="msgInput" placeholder="Write a message…" data-msg-input autocomplete="off" />
@@ -917,20 +1230,34 @@ function renderMessages(activeId){
   `;
 }
 
-function renderNotifications(){
+async function renderNotifications(){
+  const list = await db.getNotifications();
   const icons = {
     like: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.6l-1-1a5.5 5.5 0 0 0-7.8 7.8l1 1L12 21l7.8-7.6 1-1a5.5 5.5 0 0 0 0-7.8z"/></svg>',
     comment: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
     follow: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 4-6 8-6s8 2 8 6"/></svg>',
+    follow_request: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 4-6 8-6s8 2 8 6"/></svg>',
+    follow_accepted: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>',
     live: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="2" y="6" width="14" height="12" rx="2"/><path d="M16 10l6-3v10l-6-3"/></svg>',
   };
-  const unread = MOCK.notifications.filter(n=>n.unread);
-  const earlier = MOCK.notifications.filter(n=>!n.unread);
-  const row = n => `
+  const unread = list.filter(n=>n.unread);
+  const earlier = list.filter(n=>!n.unread);
+  const row = n => {
+    const isReq = n.type === 'follow_request' && n.unread;
+    const fid = n.actor_id || (n.meta && n.meta.follower_id) || '';
+    return `
     <div class="notif-item ${n.unread?'unread':''}" role="listitem">
-      <div class="notif-ic ${n.type}" aria-hidden="true">${icons[n.type]}</div>
-      <div class="notif-txt"><b>${n.actor}</b> ${n.text}<div class="notif-time">${n.time} ago</div></div>
+      <div class="notif-ic ${n.type==='follow_request'||n.type==='follow_accepted'?'follow':n.type}" aria-hidden="true">${icons[n.type]||icons.follow}</div>
+      <div class="notif-txt" style="flex:1">
+        <b>${n.actor}</b> ${n.text}
+        <div class="notif-time">${n.time} ago</div>
+        ${isReq ? `<div style="display:flex;gap:8px;margin-top:8px">
+          <button type="button" class="post-btn" style="padding:6px 14px;font-size:12px" data-accept-follow="${fid}">Confirm</button>
+          <button type="button" class="edit-btn" style="padding:6px 14px;font-size:12px" data-reject-follow="${fid}">Delete</button>
+        </div>` : ''}
+      </div>
     </div>`;
+  };
   return `
     <div class="section-eyebrow"><span>Notifications</span></div>
     <div class="panel">
@@ -941,6 +1268,7 @@ function renderNotifications(){
       <div role="list" aria-label="Notifications">
         ${unread.length ? `<div class="notif-group-label">New</div>${unread.map(row).join('')}` : ''}
         ${earlier.length ? `<div class="notif-group-label">Earlier</div>${earlier.map(row).join('')}` : ''}
+        ${!list.length ? '<div class="search-empty">No notifications yet.</div>' : ''}
       </div>
     </div>
   `;
@@ -1378,12 +1706,79 @@ function renderSettings(){
     </div>`;
 }
 
+
+let viewingUserId = null;
+
+async function renderUserProfile(){
+  const id = viewingUserId;
+  const p = await db.getProfile(id);
+  if (!p || !p.id) {
+    return `<div class="section-eyebrow"><span>Profile</span></div><div class="panel search-empty">User not found.</div>`;
+  }
+  const status = p.isSelf ? 'self' : await db.getFollowStatus(p.id);
+  let actionBtn = '';
+  if (status === 'self') {
+    actionBtn = `<button type="button" class="edit-btn" data-page="profile">Edit profile</button>`;
+  } else if (status === 'none') {
+    actionBtn = `<button type="button" class="post-btn" data-request-follow="${p.id}" style="padding:9px 18px">Add friend</button>`;
+  } else if (status === 'pending') {
+    actionBtn = `<button type="button" class="edit-btn" disabled>Requested</button>`;
+  } else if (status === 'accepted') {
+    actionBtn = `<div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button type="button" class="post-btn" style="padding:9px 16px" data-message-user="${p.id}">Message</button>
+      <button type="button" class="edit-btn" data-unfollow="${p.id}">Friends ✓</button>
+    </div>`;
+  }
+  const posts = await db.getPostsByAuthor(p.id);
+  const canSeePosts = p.isSelf || status === 'accepted' || status === 'self';
+  // Policy: followers who are accepted can see posts; also allow viewing profile always
+  const postHtml = !canSeePosts && posts.length === 0
+    ? `<div class="search-empty" style="padding:24px">Posts are visible to friends. Send a friend request to see their posts.</div>`
+    : posts.length ? posts.map(post => `
+      <article class="panel post" style="margin:12px 16px;border-radius:14px">
+        <p class="post-body">${post.body}</p>
+        ${post.media_url ? `<img src="${post.media_url}" alt="" style="width:100%;border-radius:12px;margin-top:8px" />` : (post.media ? '<div class="post-media"></div>' : '')}
+        <div class="post-foot" style="border:none;padding-top:8px">
+          <span class="post-action" style="cursor:default">${post.likes} likes</span>
+          <span class="post-action" style="cursor:default">${post.time}</span>
+        </div>
+      </article>`).join('')
+    : `<div class="search-empty" style="padding:24px">No posts yet.</div>`;
+
+  const avatarInner = p.avatar_url
+    ? `<img src="${p.avatar_url}" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:20px" />`
+    : (p.name||'U')[0];
+
+  return `
+    <div class="section-eyebrow"><span>Profile</span></div>
+    <div class="panel" style="overflow:hidden;padding:0">
+      <div class="profile-cover" role="img" aria-label="Cover"></div>
+      <div class="profile-head">
+        <div class="profile-avatar-big" style="overflow:hidden">${avatarInner}</div>
+        <div class="profile-name-row">
+          <div><h2>${p.name||''}</h2><div class="handle">${p.handle||''}</div></div>
+          ${actionBtn}
+        </div>
+        <p class="profile-bio">${p.bio||''}</p>
+        <div class="profile-stats">
+          <div><b>${posts.length}</b> Posts</div>
+        </div>
+      </div>
+      <div class="profile-tabs"><div class="profile-tab active">Posts</div></div>
+      ${postHtml}
+      <div style="height:16px"></div>
+    </div>
+  `;
+}
+
+
 const PAGE_RENDERERS = {
   home: renderHome,
   explore: renderExplore,
   messages: () => renderMessages(activeConversationId),
   notifications: renderNotifications,
   profile: renderProfile,
+  user: renderUserProfile,
   search: () => renderSearch(lastSearchQuery),
   spaces: renderSpaces,
   world: renderWorld,
@@ -1521,18 +1916,45 @@ function attachPageHandlers(){
     if (sendBtn && msgInput){
       const send = async ()=>{
         const val = msgInput.value.trim();
-        if (!val) return;
-        await db.sendMessage(activeConversationId, val);
+        if (!val || !activeConversationId) return;
+        sendBtn.disabled = true;
+        const res = await db.sendMessage(activeConversationId, val);
+        sendBtn.disabled = false;
+        if (!res || !res.ok) {
+          alert((res && res.error) || 'Could not send');
+          return;
+        }
         msgInput.value = '';
-        const convo = MOCK.conversations.find(c=>c.id===activeConversationId);
-        if (convo) convo.preview = val;
         const body = root.querySelector('[data-thread-body]');
-        body.insertAdjacentHTML('beforeend', `<div class="bubble me" role="listitem">${val}<time>${nowTime()}</time></div>`);
-        body.scrollTop = body.scrollHeight;
+        if (body) {
+          const empty = body.querySelector('.search-empty');
+          if (empty) empty.remove();
+          const t = (res.message && res.message.time) || nowTime();
+          body.insertAdjacentHTML('beforeend', `<div class="bubble me" role="listitem">${val}<time>${t}</time></div>`);
+          body.scrollTop = body.scrollHeight;
+        }
       };
       sendBtn.addEventListener('click', send);
       msgInput.addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
     }
+
+    // Start chat from profile
+    root.querySelectorAll('[data-message-user]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const uid = btn.getAttribute('data-message-user');
+        btn.disabled = true;
+        btn.textContent = 'Opening…';
+        const res = await db.getOrCreateConversation(uid);
+        btn.disabled = false;
+        btn.textContent = 'Message';
+        if (!res.ok) {
+          alert(res.error || 'Could not open chat');
+          return;
+        }
+        activeConversationId = res.id;
+        showPage('messages');
+      });
+    });
     const searchPageInput = root.querySelector('#searchPageInput');
     if (searchPageInput){
       searchPageInput.addEventListener('input', ()=> showPage('search', { query: searchPageInput.value }));
@@ -1587,7 +2009,130 @@ function attachPageHandlers(){
       aiInput.addEventListener('keydown', e => { if (e.key === 'Enter') sendAI(); });
     }
 
+
+    // Open other user profiles from search
+    root.querySelectorAll('[data-profile-id]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const id = btn.getAttribute('data-profile-id');
+        if (!id) return;
+        viewingUserId = id;
+        showPage('user');
+      });
+    });
+
+    // Friend request
+    root.querySelectorAll('[data-request-follow]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const id = btn.getAttribute('data-request-follow');
+        btn.disabled = true;
+        btn.textContent = 'Sending…';
+        const res = await db.requestFollow(id);
+        if (res.ok) {
+          btn.textContent = 'Requested';
+        } else {
+          btn.disabled = false;
+          btn.textContent = 'Add friend';
+          alert(res.error || 'Could not send request');
+        }
+      });
+    });
+
+    root.querySelectorAll('[data-unfollow]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        if (!confirm('Remove this friend?')) return;
+        await db.unfollow(btn.getAttribute('data-unfollow'));
+        showPage('user');
+      });
+    });
+
+    root.querySelectorAll('[data-accept-follow]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const id = btn.getAttribute('data-accept-follow');
+        btn.disabled = true;
+        await db.acceptFollow(id);
+        showPage('notifications');
+      });
+    });
+
+    root.querySelectorAll('[data-reject-follow]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const id = btn.getAttribute('data-reject-follow');
+        await db.rejectFollow(id);
+        showPage('notifications');
+      });
+    });
+
+    // Home composer → real post
+    const homePostBtn = root.querySelector('.composer .post-btn');
+    const homeComposer = root.querySelector('#composerText');
+    if (homePostBtn && homeComposer) {
+      homePostBtn.addEventListener('click', async () => {
+        const body = homeComposer.value.trim();
+        if (!body) { homeComposer.focus(); return; }
+        homePostBtn.disabled = true;
+        const res = await db.createPost(body);
+        homePostBtn.disabled = false;
+        if (res.ok) {
+          homeComposer.value = '';
+          showPage('home');
+        } else {
+          alert(res.error || 'Could not post. Are you logged in?');
+        }
+      });
+    }
+
+    // Create page post
+    const createBtn2 = root.querySelector('#createPostBtn');
+    const createText2 = root.querySelector('#createComposer');
+    if (createBtn2 && createText2 && !createBtn2.dataset.bound) {
+      createBtn2.dataset.bound = '1';
+      createBtn2.addEventListener('click', async () => {
+        const body = createText2.value.trim();
+        if (!body) { createText2.focus(); return; }
+        createBtn2.disabled = true;
+        const res = await db.createPost(body);
+        createBtn2.disabled = false;
+        if (res.ok) {
+          createText2.value = '';
+          showPage('home');
+        } else alert(res.error || 'Could not post');
+      });
+    }
+
+    // Avatar file input on profile edit
+    const changeAvatarBtn = root.querySelector('#changeAvatarBtn');
+    if (changeAvatarBtn && !changeAvatarBtn.dataset.bound) {
+      changeAvatarBtn.dataset.bound = '1';
+      changeAvatarBtn.addEventListener('click', () => {
+        let inp = document.getElementById('avatarFileInput');
+        if (!inp) {
+          inp = document.createElement('input');
+          inp.type = 'file';
+          inp.accept = 'image/*';
+          inp.id = 'avatarFileInput';
+          inp.hidden = true;
+          document.body.appendChild(inp);
+          inp.addEventListener('change', async () => {
+            const file = inp.files && inp.files[0];
+            if (!file) return;
+            changeAvatarBtn.textContent = 'Uploading…';
+            const res = await db.uploadAvatar(file);
+            if (res.ok) {
+              const prev = document.getElementById('editAvatarPreview');
+              if (prev) prev.innerHTML = `<img src="${res.url}" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:20px" />`;
+              changeAvatarBtn.textContent = 'Photo updated';
+            } else {
+              changeAvatarBtn.textContent = 'Change photo';
+              alert(res.error || 'Upload failed. Create an "avatars" public bucket in Supabase Storage.');
+            }
+          });
+        }
+        inp.click();
+      });
+    }
+
     // ——— Edit Profile ———
+
     const editBtn = root.querySelector('#editProfileBtn');
     const profileView = root.querySelector('#profileView');
     const profileEdit = root.querySelector('#profileEdit');
