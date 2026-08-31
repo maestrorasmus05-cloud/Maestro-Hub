@@ -807,6 +807,46 @@ const db = {
     }
     return MOCK.conversations;
   },
+  async getConversationById(conversationId, otherUserId, otherUserName){
+    if (!sb || !conversationId) return null;
+    const user = await this.currentUser();
+    if (!user) return null;
+    let otherProfile = null;
+    if (otherUserId) {
+      const { data: prof } = await sb.from('profiles').select('id, name, handle, avatar_url').eq('id', otherUserId).maybeSingle();
+      otherProfile = prof || null;
+    }
+    if (!otherProfile) {
+      const { data: members } = await sb.from('conversation_members')
+        .select('user_id, profiles(id, name, handle, avatar_url)')
+        .eq('conversation_id', conversationId);
+      const other = (members || []).find(m => m.user_id !== user.id);
+      otherProfile = other?.profiles || (other ? {id:other.user_id,name:otherUserName||'Friend',handle:'',avatar_url:null} : null);
+    }
+    const { data: msgs, error: msgErr } = await sb.from('messages')
+      .select('id, body, sender_id, created_at')
+      .eq('conversation_id', conversationId)
+      .order('created_at', { ascending: true })
+      .limit(200);
+    if (msgErr) console.warn('Could not load messages:', msgErr.message);
+    const messages = (msgs || []).map(m => ({
+      id:m.id,
+      from:m.sender_id === user.id ? 'me' : 'them',
+      body:m.body,
+      time:m.created_at ? new Date(m.created_at).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : ''
+    }));
+    const last = messages[messages.length-1];
+    return {
+      id:conversationId,
+      name:otherProfile?.name || otherUserName || 'Friend',
+      other_id:otherProfile?.id || otherUserId || null,
+      avatar_url:otherProfile?.avatar_url || null,
+      online:false,
+      unread:0,
+      preview:last ? last.body : 'No messages yet',
+      messages
+    };
+  },
   async getOrCreateConversation(otherUserId){
     if (!sb) return { ok: false, error: 'Not connected' };
     const user = await this.currentUser();
@@ -1149,6 +1189,8 @@ const MOCK = {
 
 let currentPage = 'home';
 let activeConversationId = null;
+let activeChatUserId = null;
+let activeChatUserName = '';
 let lastSearchQuery = '';
 
 async function renderHome(){
@@ -1259,17 +1301,31 @@ function renderExplore(){
 }
 
 async function renderMessages(activeId){
-  const convos = await db.getConversations();
-  if (!convos.length) {
+  let convos = await db.getConversations();
+  let active = activeId ? convos.find(c => c.id === activeId) : null;
+
+  // IMPORTANT: a brand-new conversation may not appear in the list immediately
+  // after the RPC returns. Load it directly so tapping Message always opens chat.
+  if (activeId && !active) {
+    const direct = await db.getConversationById(activeId, activeChatUserId, activeChatUserName);
+    if (direct) {
+      active = direct;
+      convos = [direct, ...convos.filter(c => c.id !== direct.id)];
+    }
+  }
+
+  if (!convos.length && !active) {
     return `
       <div class="section-eyebrow"><span>Messages</span></div>
       <div class="panel search-empty">
         No conversations yet.<br/><br/>
-        Open a <b>friend’s profile</b> and tap <b>Message</b> to start chatting.
+        Search for a friend, open their profile, then tap <b>Message</b>.
       </div>`;
   }
-  const active = convos.find(c => c.id === activeId) || convos[0];
+  active = active || convos[0];
   activeConversationId = active.id;
+  activeChatUserId = active.other_id || activeChatUserId;
+  activeChatUserName = active.name || activeChatUserName;
   const listHtml = convos.map(c => `
     <button type="button" class="msg-list-item ${c.id===active.id?'active':''}" data-convo="${c.id}" aria-label="Conversation with ${c.name}">
       <div class="avatar" aria-hidden="true">${(c.name||'?')[0]}</div>
@@ -1283,8 +1339,8 @@ async function renderMessages(activeId){
   return `
     <div class="section-eyebrow"><span>Messages</span></div>
     <div class="panel messages-layout">
-      <div class="msg-list" data-msg-list role="list" aria-label="Conversations">${listHtml}</div>
-      <div class="thread" aria-label="Conversation with ${active.name}">
+      <div class="msg-list ${activeId ? 'hide-mobile' : ''}" data-msg-list role="list" aria-label="Conversations">${listHtml}</div>
+      <div class="thread ${activeId ? '' : 'hide-mobile'}" aria-label="Conversation with ${active.name}">
         <div class="back-row" data-back-to-list>
           <button type="button" class="icon-btn" style="position:static;background:var(--charcoal);border-color:var(--line-strong);" aria-label="Back to conversations">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg>
@@ -1813,7 +1869,7 @@ async function renderUserProfile(){
     actionBtn = `<button type="button" class="edit-btn" disabled>Requested</button>`;
   } else if (status === 'accepted') {
     actionBtn = `<div style="display:flex;gap:8px;flex-wrap:wrap">
-      <button type="button" class="post-btn" style="padding:9px 16px" data-message-user="${p.id}">Message</button>
+      <button type="button" class="post-btn" style="padding:9px 16px" data-message-user="${p.id}" data-message-name="${(p.name||'Friend').replace(/&/g,'&amp;').replace(/"/g,'&quot;')}">Message</button>
       <button type="button" class="edit-btn" data-unfollow="${p.id}">Friends ✓</button>
     </div>`;
   }
@@ -2028,9 +2084,11 @@ function attachPageHandlers(){
       });
     });
     root.querySelectorAll('[data-convo]').forEach(row=>{
-      row.addEventListener('click', ()=>{
+      row.addEventListener('click', async ()=>{
         activeConversationId = row.dataset.convo;
-        showPage('messages');
+        activeChatUserId = null;
+        activeChatUserName = '';
+        await showPage('messages');
         const layout = document.querySelector((root.id==='mobileSlot'?'#mobileSlot':'#centerSlot')+' .messages-layout');
         if (layout && window.innerWidth <= 720){
           layout.querySelector('[data-msg-list]').classList.add('hide-mobile');
@@ -2110,17 +2168,33 @@ function attachPageHandlers(){
     root.querySelectorAll('[data-message-user]').forEach(btn => {
       btn.addEventListener('click', async () => {
         const uid = btn.getAttribute('data-message-user');
+        const friendName = btn.getAttribute('data-message-name') || 'Friend';
         btn.disabled = true;
-        btn.textContent = 'Opening…';
+        btn.textContent = 'Opening chat…';
         const res = await db.getOrCreateConversation(uid);
-        btn.disabled = false;
-        btn.textContent = 'Message';
         if (!res.ok) {
+          btn.disabled = false;
+          btn.textContent = 'Message';
           alert(res.error || 'Could not open chat');
           return;
         }
+        // Keep the selected friend attached to this conversation. This prevents
+        // the Messages page from forgetting who was selected while Supabase catches up.
         activeConversationId = res.id;
-        showPage('messages');
+        activeChatUserId = uid;
+        activeChatUserName = friendName;
+        await showPage('messages');
+        btn.disabled = false;
+        btn.textContent = 'Message';
+
+        // On phones, open the conversation thread immediately, not the inbox list.
+        if (window.innerWidth <= 720) {
+          document.querySelectorAll('.messages-layout').forEach(layout => {
+            layout.querySelector('[data-msg-list]')?.classList.add('hide-mobile');
+            layout.querySelector('.thread')?.classList.remove('hide-mobile');
+          });
+        }
+        document.querySelector('#mobileSlot [data-msg-input], #centerSlot [data-msg-input]')?.focus();
       });
     });
     const searchPageInput = root.querySelector('#searchPageInput');
