@@ -506,6 +506,8 @@
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg><span>Explore</span></a></li>
           <li><a href="#spaces" class="nav-item" data-page="spaces">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="8" cy="9" r="3"/><circle cx="17" cy="9" r="3"/><path d="M2 20c0-3 3-5 6-5s6 2 6 5M11 20c0-2.5 2.5-4.5 6-4.5s6 2 6 4.5"/></svg><span>Spaces</span></a></li>
+          <li><a href="#groups" class="nav-item" data-page="groups">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg><span>Groups</span></a></li>
           <li><a href="#world" class="nav-item" data-page="world">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.6 4 6 4 9s-1.5 6.4-4 9c-2.5-2.6-4-6-4-9s1.5-6.4 4-9z"/></svg><span>Maestro World</span></a></li>
           <li><a href="#messages" class="nav-item" data-page="messages">
@@ -875,19 +877,24 @@ const db = {
       [...(peopleByName||[]), ...(peopleByHandle||[])].forEach(p => { if (p && p.id) map.set(p.id, p); });
       return { people: [...map.values()], spaces: spaces||[], posts: posts||[] };
     }
+    // Only use mock when Supabase is NOT connected
     const q = query.toLowerCase();
     return {
-      people: MOCK.people.filter(p => p.name.toLowerCase().includes(q) || p.handle.toLowerCase().includes(q)),
+      people: MOCK.people.filter(p => p.name.toLowerCase().includes(q) || (p.handle||'').toLowerCase().includes(q)),
       spaces: MOCK.spaces.filter(s => s.name.toLowerCase().includes(q)),
       posts: MOCK.posts.filter(p => p.body.toLowerCase().includes(q)),
     };
   },
   async getPeople(){
     if (sb) {
-      const { data, error } = await sb.from('profiles').select('id, name, handle, bio, avatar_url').order('name').limit(50);
-      if (!error && data && data.length) return data;
+      const { data, error } = await sb.from('profiles').select('id, name, handle, bio, avatar_url').order('name').limit(100);
+      if (error) {
+        console.warn('getPeople', error.message);
+        return { __error: error.message, list: [] };
+      }
+      return { list: data || [] };
     }
-    return MOCK.people;
+    return { list: MOCK.people };
   },
   async ensureProfile({ id, name, handle, email }){
     if (!sb || !id) return;
@@ -1007,6 +1014,53 @@ const db = {
     const user = await this.currentUser();
     if (!user) return { ok: false, error: 'Not logged in' };
     const { error } = await sb.from('profiles').update(fields).eq('id', user.id);
+    if (error) return { ok: false, error: error.message };
+    return { ok: true };
+  },
+  async getGroups(){
+    if (!sb) return [];
+    const { data, error } = await sb.from('groups').select('id, name, description, owner_id, created_at').order('created_at', { ascending: false }).limit(50);
+    if (error) { console.warn(error.message); return []; }
+    return data || [];
+  },
+  async createGroup(name, description){
+    if (!sb) return { ok: false, error: 'Not connected' };
+    const user = await this.currentUser();
+    if (!user) return { ok: false, error: 'Not logged in' };
+    const { data, error } = await sb.from('groups').insert({ name, description: description||'', owner_id: user.id }).select('id').single();
+    if (error) return { ok: false, error: error.message };
+    await sb.from('group_members').insert({ group_id: data.id, user_id: user.id, role: 'owner' });
+    return { ok: true, id: data.id };
+  },
+  async joinGroup(groupId){
+    if (!sb) return { ok: false };
+    const user = await this.currentUser();
+    if (!user) return { ok: false, error: 'Not logged in' };
+    const { error } = await sb.from('group_members').upsert({ group_id: groupId, user_id: user.id, role: 'member' });
+    if (error) return { ok: false, error: error.message };
+    return { ok: true };
+  },
+  async getGroupMessages(groupId){
+    if (!sb) return [];
+    const { data } = await sb.from('group_messages')
+      .select('id, body, sender_id, created_at, profiles(name, handle)')
+      .eq('group_id', groupId)
+      .order('created_at', { ascending: true })
+      .limit(100);
+    const user = await this.currentUser();
+    return (data||[]).map(m => ({
+      id: m.id,
+      body: m.body,
+      from: m.sender_id === user?.id ? 'me' : 'them',
+      name: m.profiles?.name || 'User',
+      time: m.created_at ? new Date(m.created_at).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}) : ''
+    }));
+  },
+  async sendGroupMessage(groupId, body){
+    if (!sb) return { ok: false };
+    const user = await this.currentUser();
+    if (!user) return { ok: false, error: 'Not logged in' };
+    const { error } = await sb.from('group_messages').insert({ group_id: groupId, sender_id: user.id, body });
     if (error) return { ok: false, error: error.message };
     return { ok: true };
   }
@@ -1369,21 +1423,31 @@ async function renderSearch(query){
     </div>`;
   if (!query.trim()) {
     // Show real people directory when search is empty
-    const allPeople = await db.getPeople();
+    const peopleRes = await db.getPeople();
+    const allPeople = peopleRes.list || peopleRes || [];
+    const err = peopleRes.__error;
     const list = (allPeople||[]).map(p => {
       const name = p.name || 'User';
       const handle = p.handle || '';
       const bio = p.bio || '';
       const letter = name[0] || '?';
+      const av = p.avatar_url ? `<img src="${p.avatar_url}" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:50%" />` : letter;
       return `<button type="button" class="search-row" data-profile-id="${p.id||''}" aria-label="${name}">
-        <div class="avatar" aria-hidden="true">${letter}</div>
+        <div class="avatar" aria-hidden="true" style="overflow:hidden">${av}</div>
         <div><div class="t">${name}</div><div class="s">${handle}${bio ? ' · ' + bio : ''}</div></div>
+        <span style="margin-left:auto;font-size:12px;color:var(--lime);font-weight:600">View</span>
       </button>`;
     }).join('');
+    const statusLine = !sb
+      ? '<div class="search-empty">Supabase not connected — showing demo names only.</div>'
+      : err
+        ? `<div class="search-empty" style="color:var(--danger)">Could not load profiles: ${err}<br/>Run supabase-social.sql in Supabase SQL Editor.</div>`
+        : (list
+          ? `<div class="search-section-label">People on Maestro Hub (${allPeople.length})</div>${list}`
+          : '<div class="search-empty">No profiles in database yet.<br/>1) Run SQL setup<br/>2) Log in once per account (creates profile)<br/>3) Refresh Search</div>');
     return `<div class="section-eyebrow"><span>Search</span></div>${inputRow}
       <div class="panel search-results" role="region" aria-label="People on Maestro Hub">
-        <div class="search-section-label">People on Maestro Hub</div>
-        ${list || '<div class="search-empty">No profiles yet. Sign up accounts will appear here.</div>'}
+        ${statusLine}
       </div>`;
   }
   const results = await db.search(query);
@@ -1772,6 +1836,51 @@ async function renderUserProfile(){
 }
 
 
+
+let activeGroupId = null;
+async function renderGroups(){
+  const groups = await db.getGroups();
+  if (activeGroupId) {
+    const g = groups.find(x => x.id === activeGroupId) || { name: 'Group', id: activeGroupId };
+    const msgs = await db.getGroupMessages(activeGroupId);
+    const bubbles = msgs.map(m => `<div class="bubble ${m.from}" role="listitem"><b style="font-size:11px;opacity:.8">${m.name}</b><br/>${m.body}<time>${m.time}</time></div>`).join('');
+    return `
+      <div class="section-eyebrow"><span>Group chat</span>
+        <button type="button" class="edit-btn" style="padding:4px 10px;font-size:12px" data-back-groups>← All groups</button>
+      </div>
+      <div class="panel" style="padding:0;display:flex;flex-direction:column;min-height:420px">
+        <div style="padding:14px 16px;border-bottom:1px solid var(--line);font-weight:700">${g.name||'Group'}</div>
+        <div class="thread-body" data-group-thread style="flex:1;padding:16px;display:flex;flex-direction:column;gap:10px;overflow-y:auto">${bubbles||'<div class="search-empty">No messages yet</div>'}</div>
+        <div class="thread-input">
+          <input type="text" placeholder="Message the group…" data-group-input />
+          <button type="button" data-group-send aria-label="Send"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4z"/></svg></button>
+        </div>
+      </div>`;
+  }
+  const cards = (groups||[]).map(g => `
+    <div class="panel" style="padding:14px;display:flex;justify-content:space-between;align-items:center;gap:12px">
+      <div>
+        <div style="font-weight:700">${g.name}</div>
+        <div style="font-size:12px;color:var(--muted-2)">${g.description||'Group chat'}</div>
+      </div>
+      <div style="display:flex;gap:8px">
+        <button type="button" class="edit-btn" data-join-group="${g.id}">Join</button>
+        <button type="button" class="post-btn" style="padding:8px 14px" data-open-group="${g.id}">Open</button>
+      </div>
+    </div>`).join('');
+  return `
+    <div class="section-eyebrow"><span>Groups</span></div>
+    <div class="panel" style="padding:16px;margin-bottom:12px">
+      <div style="font-weight:700;margin-bottom:10px">Create a group</div>
+      <input type="text" id="newGroupName" placeholder="Group name" style="width:100%;padding:10px 12px;border-radius:12px;background:var(--charcoal);border:1px solid var(--line-strong);color:var(--off-white);margin-bottom:8px" />
+      <input type="text" id="newGroupDesc" placeholder="Description (optional)" style="width:100%;padding:10px 12px;border-radius:12px;background:var(--charcoal);border:1px solid var(--line-strong);color:var(--off-white);margin-bottom:10px" />
+      <button type="button" class="post-btn" id="createGroupBtn">Create group</button>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:10px">
+      ${cards || '<div class="panel search-empty">No groups yet. Create one above.</div>'}
+    </div>`;
+}
+
 const PAGE_RENDERERS = {
   home: renderHome,
   explore: renderExplore,
@@ -1781,6 +1890,7 @@ const PAGE_RENDERERS = {
   user: renderUserProfile,
   search: () => renderSearch(lastSearchQuery),
   spaces: renderSpaces,
+  groups: renderGroups,
   world: renderWorld,
   create: renderCreate,
   ai: renderAI,
@@ -1936,6 +2046,40 @@ function attachPageHandlers(){
       };
       sendBtn.addEventListener('click', send);
       msgInput.addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
+    }
+
+    // Groups
+    root.querySelector('#createGroupBtn')?.addEventListener('click', async () => {
+      const name = root.querySelector('#newGroupName')?.value.trim();
+      const desc = root.querySelector('#newGroupDesc')?.value.trim() || '';
+      if (!name) return;
+      const res = await db.createGroup(name, desc);
+      if (res.ok) { activeGroupId = null; showPage('groups'); }
+      else alert(res.error || 'Failed');
+    });
+    root.querySelectorAll('[data-open-group]').forEach(btn => {
+      btn.addEventListener('click', () => { activeGroupId = btn.getAttribute('data-open-group'); showPage('groups'); });
+    });
+    root.querySelectorAll('[data-join-group]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const res = await db.joinGroup(btn.getAttribute('data-join-group'));
+        if (!res.ok) alert(res.error || 'Could not join');
+        else { btn.textContent = 'Joined'; btn.disabled = true; }
+      });
+    });
+    root.querySelector('[data-back-groups]')?.addEventListener('click', () => { activeGroupId = null; showPage('groups'); });
+    const gSend = root.querySelector('[data-group-send]');
+    const gInput = root.querySelector('[data-group-input]');
+    if (gSend && gInput && activeGroupId) {
+      const sendG = async () => {
+        const val = gInput.value.trim();
+        if (!val) return;
+        const res = await db.sendGroupMessage(activeGroupId, val);
+        if (res.ok) { gInput.value = ''; showPage('groups'); }
+        else alert(res.error || 'Send failed');
+      };
+      gSend.addEventListener('click', sendG);
+      gInput.addEventListener('keydown', e => { if (e.key === 'Enter') sendG(); });
     }
 
     // Start chat from profile
