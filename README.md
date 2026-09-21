@@ -1,37 +1,24 @@
-# Maestro Hub
+# Maestro Hub — Installable App
 
-AI-powered social platform UI — spaces, moments, live rooms, and Maestro AI.
+This version adds a Progressive Web App (PWA) install/download system.
 
 ## Files
+- `index.html` — Maestro Hub website with Install App controls
+- `manifest.json` — app name, icon, theme, and install settings
+- `sw.js` — service worker for the app shell/offline caching
+- `icon-192.png` / `icon-512.png` — PWA icons
+- `favicon.svg` — site icon
 
-- `index.html` — full app (auth + all pages)
-- `favicon.svg` — lime “M” icon
+## Deploy
+Upload all files together to the same folder on Netlify, GitHub Pages, or another HTTPS host.
 
-## Quick start
+## Install
+On a supported browser, the site will show an **Install Maestro Hub** button.
+- Android/Chrome/Edge: use the Install button or browser menu.
+- iPhone/iPad: Share → Add to Home Screen.
+- Windows/macOS/Linux: use the browser's Install/Add to Home Screen option when offered.
 
-1. Open `index.html` in a browser, **or** serve the folder:
-   ```bash
-   npx serve .
-   ```
-2. Use **Sign up / Log in** (demo mode works without keys) or **Continue as guest**.
-3. When you have Supabase keys, open `index.html` and replace:
+The app must be served over HTTPS for the service worker and browser install prompt to work (localhost also works for development).
 
-```js
-const SUPABASE_URL = 'YOUR_SUPABASE_URL';
-const SUPABASE_ANON_KEY = 'YOUR_SUPABASE_ANON_KEY';
-```
-
-with your Project URL and anon key from Supabase → Project Settings → API.
-
-## Auth
-
-- **Demo / guest**: works offline; session stored in `localStorage`
-- **Supabase**: real email/password when keys are set
-- **Log out**: Settings → Data & export → Log out
-
-## Next steps
-
-1. Create tables in Supabase (see SQL in the setup guide)
-2. Paste keys into `index.html`
-3. Push this folder to GitHub and deploy (Pages / Netlify / Vercel)
-
+## Important
+Supabase/API requests remain live and are not cached by the service worker.

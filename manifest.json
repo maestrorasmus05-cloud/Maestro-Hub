@@ -1,0 +1,26 @@
+{
+  "name": "Maestro Hub",
+  "short_name": "Maestro Hub",
+  "description": "AI-powered social platform for creators, spaces, and real-time communities.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0A0B0D",
+  "theme_color": "#C8FF4D",
+  "categories": ["social", "community", "productivity"],
+  "icons": [
+    {
+      "src": "./icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "./icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
